@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import (
-    LTTextContainer, LTTextLine, LTChar, LTFigure, LAParams, LTAnon
+    LTTextContainer, LTTextLine, LTChar, LTFigure, LAParams
 )
 import io
 import os
@@ -54,15 +54,8 @@ def extract_text_blocks(container, page_height, page_width, page_num):
             if not chars:
                 continue
 
-            # Build text from chars + LTAnon (spaces/ligatures)
-            line_text = ""
-            for obj in line:
-                if isinstance(obj, LTChar):
-                    line_text += obj.get_text()
-                elif isinstance(obj, LTAnon):
-                    line_text += obj.get_text()
-
-            line_text = line_text.strip()
+            # get_text() handles chars, spaces and ligatures correctly
+            line_text = line.get_text().strip()
             if not line_text:
                 continue
 
