@@ -85,13 +85,38 @@ async def extract_pdf(file: UploadFile = File(...)):
     try:
         content = await file.read()
         pages_data = []
+        debug_log = []  # collects all debug info returned in response
+
+        debug_log.append(f"File received: {file.filename}, size: {len(content)} bytes")
 
         laparams = LAParams()
         for page_num, page_layout in enumerate(extract_pages(io.BytesIO(content), laparams=laparams), start=1):
             page_w = float(page_layout.width)
             page_h = float(page_layout.height)
+            debug_log.append(f"--- Page {page_num}: {page_w}x{page_h} ---")
+
+            # Log every top-level element type found on the page
+            for i, element in enumerate(page_layout):
+                etype = type(element).__name__
+                is_text = isinstance(element, LTTextContainer)
+                is_fig  = isinstance(element, LTFigure)
+                raw     = element.get_text().strip()[:60] if is_text else ""
+                debug_log.append(
+                    f"  elem[{i}] type={etype} | isText={is_text} | isFigure={is_fig}"
+                    + (f' | text="{raw}"' if raw else "")
+                )
+                # If it's a figure, peek one level inside
+                if is_fig:
+                    for j, child in enumerate(element):
+                        ctype = type(child).__name__
+                        ctext = child.get_text().strip()[:60] if isinstance(child, LTTextContainer) else ""
+                        debug_log.append(
+                            f"    fig_child[{j}] type={ctype}"
+                            + (f' | text="{ctext}"' if ctext else "")
+                        )
 
             text_blocks = extract_text_blocks(page_layout, page_h, page_w, 0, page_num)
+            debug_log.append(f"  => extracted {len(text_blocks)} text blocks")
 
             pages_data.append({
                 "page": page_num,
@@ -100,7 +125,8 @@ async def extract_pdf(file: UploadFile = File(...)):
                 "textBlocks": text_blocks
             })
 
-        return JSONResponse(content=pages_data)
+        # Return both the data and the debug log together
+        return JSONResponse(content={"debug": debug_log, "pages": pages_data})
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
