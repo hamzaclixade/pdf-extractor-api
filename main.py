@@ -1,12 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextContainer, LTChar
-import json
+from pdfminer.layout import LTTextContainer, LTTextLine, LTChar
 import io
 import os
 
 app = FastAPI(title="PDF Extractor API")
+
 
 def get_font_info(char):
     fontname = getattr(char, 'fontname', 'Unknown')
@@ -22,7 +22,6 @@ def get_font_info(char):
 async def extract_pdf(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-
     try:
         content = await file.read()
         pages_data = []
@@ -33,19 +32,29 @@ async def extract_pdf(file: UploadFile = File(...)):
 
             for element in page_layout:
                 if isinstance(element, LTTextContainer):
-                    chars = [obj for obj in element if isinstance(obj, LTChar)]
-                    if not chars:
-                        continue
-
-                    sample = chars[0]
-                    font_family, font_size, is_bold, is_italic, color_hex = get_font_info(sample)
-
+                    # Extract text first — works independently of char extraction
                     text = element.get_text().strip()
                     if not text:
                         continue
 
+                    # Flatten chars: LTTextBox -> LTTextLine -> LTChar
+                    chars = []
+                    for line in element:
+                        if isinstance(line, LTTextLine):
+                            for obj in line:
+                                if isinstance(obj, LTChar):
+                                    chars.append(obj)
+
+                    # Use first char for font info, fallback gracefully if none
+                    if chars:
+                        font_family, font_size, is_bold, is_italic, color_hex = get_font_info(chars[0])
+                    else:
+                        font_family, font_size, is_bold, is_italic, color_hex = "Unknown", 10.0, False, False, "#000000"
+
+                    # Detect center alignment
                     alignment = "left"
-                    if abs(element.x0 + element.width/2 - page_layout.width/2) < 50:
+                    element_center = element.x0 + element.width / 2
+                    if abs(element_center - page_layout.width / 2) < 50:
                         alignment = "center"
 
                     block = {
@@ -70,13 +79,12 @@ async def extract_pdf(file: UploadFile = File(...)):
                     text_blocks.append(block)
                     block_id_counter += 1
 
-            page_data = {
+            pages_data.append({
                 "page": page_num,
                 "pageWidth": round(float(page_layout.width), 1),
                 "pageHeight": round(float(page_layout.height), 1),
                 "textBlocks": text_blocks
-            }
-            pages_data.append(page_data)
+            })
 
         return JSONResponse(content=pages_data)
 
@@ -89,7 +97,6 @@ async def root():
     return {"message": "PDF Extractor API is running. Use POST /extract-pdf"}
 
 
-# Important: Use Railway's $PORT
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
