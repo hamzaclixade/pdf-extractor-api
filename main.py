@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import (
-    LTTextContainer, LTTextLine, LTChar, LTFigure, LAParams
+    LTTextContainer, LTTextLine, LTChar, LTFigure, LAParams, LTAnon
 )
 import io
 import os
@@ -10,8 +10,15 @@ import os
 app = FastAPI(title="PDF Extractor API")
 
 
+def clean_font_name(fontname: str) -> str:
+    """Strip subset prefix like 'BAAAAA+' from embedded font names."""
+    if '+' in fontname:
+        return fontname.split('+', 1)[1]
+    return fontname
+
+
 def get_font_info(char):
-    fontname = getattr(char, 'fontname', 'Unknown')
+    fontname = clean_font_name(getattr(char, 'fontname', 'Unknown'))
     fontsize = getattr(char, 'size', 10.0)
     lower = fontname.lower()
     is_bold = 'bold' in lower
@@ -19,61 +26,73 @@ def get_font_info(char):
     return fontname, round(float(fontsize), 1), is_bold, is_italic, "#000000"
 
 
-def extract_text_blocks(container, page_height, page_width, block_id_counter, page_num):
-    """Recursively extract text blocks from any container (page or LTFigure)."""
+def extract_text_blocks(container, page_height, page_width, page_num):
+    """
+    Extract one block per visual line (LTTextLine), not per text box.
+    This matches line-level granularity expected in the output.
+    Recurses into LTFigure for nested XObjects.
+    """
     blocks = []
+
     for element in container:
-        # Recurse into figures (nested XObjects)
+        # Recurse into figures
         if isinstance(element, LTFigure):
-            nested = extract_text_blocks(element, page_height, page_width, block_id_counter + len(blocks), page_num)
+            nested = extract_text_blocks(element, page_height, page_width, page_num)
             blocks.extend(nested)
             continue
 
         if not isinstance(element, LTTextContainer):
             continue
 
-        text = element.get_text().strip()
-        if not text:
-            continue
-
-        # Flatten chars: LTTextBox -> LTTextLine -> LTChar
-        chars = []
+        # Process each line individually instead of the whole text box
         for line in element:
-            if isinstance(line, LTTextLine):
-                for obj in line:
-                    if isinstance(obj, LTChar):
-                        chars.append(obj)
+            if not isinstance(line, LTTextLine):
+                continue
 
-        if chars:
+            # Collect chars from this line
+            chars = [obj for obj in line if isinstance(obj, LTChar)]
+            if not chars:
+                continue
+
+            # Build text from chars + LTAnon (spaces/ligatures)
+            line_text = ""
+            for obj in line:
+                if isinstance(obj, LTChar):
+                    line_text += obj.get_text()
+                elif isinstance(obj, LTAnon):
+                    line_text += obj.get_text()
+
+            line_text = line_text.strip()
+            if not line_text:
+                continue
+
             font_family, font_size, is_bold, is_italic, color_hex = get_font_info(chars[0])
-        else:
-            font_family, font_size, is_bold, is_italic, color_hex = "Unknown", 10.0, False, False, "#000000"
 
-        alignment = "left"
-        element_center = element.x0 + element.width / 2
-        if abs(element_center - page_width / 2) < 50:
-            alignment = "center"
+            alignment = "left"
+            line_center = line.x0 + line.width / 2
+            if abs(line_center - page_width / 2) < 50:
+                alignment = "center"
 
-        idx = block_id_counter + len(blocks)
-        blocks.append({
-            "text": text,
-            "x": round(float(element.x0), 2),
-            "y": round(float(page_height - element.y1), 2),
-            "width": round(float(element.width), 2),
-            "height": round(float(element.height), 2),
-            "fontSize": font_size,
-            "fontFamily": font_family,
-            "colorHex": color_hex,
-            "isBold": is_bold,
-            "isItalic": is_italic,
-            "blockId": f"p{page_num}_b{idx:03d}",
-            "flowGroup": "body",
-            "alignment": alignment,
-            "paragraphSpacing": 6.0,
-            "isFixedPosition": False,
-            "continuedFromId": None,
-            "continuedToId": None
-        })
+            idx = len(blocks)
+            blocks.append({
+                "text": line_text,
+                "x": round(float(line.x0), 2),
+                "y": round(float(page_height - line.y1), 2),
+                "width": round(float(line.width), 2),
+                "height": round(float(line.height), 2),
+                "fontSize": font_size,
+                "fontFamily": font_family,
+                "colorHex": color_hex,
+                "isBold": is_bold,
+                "isItalic": is_italic,
+                "blockId": f"p{page_num}_b{idx:03d}",
+                "flowGroup": "body",
+                "alignment": alignment,
+                "paragraphSpacing": 6.0,
+                "isFixedPosition": False,
+                "continuedFromId": None,
+                "continuedToId": None
+            })
 
     return blocks
 
@@ -85,38 +104,13 @@ async def extract_pdf(file: UploadFile = File(...)):
     try:
         content = await file.read()
         pages_data = []
-        debug_log = []  # collects all debug info returned in response
-
-        debug_log.append(f"File received: {file.filename}, size: {len(content)} bytes")
 
         laparams = LAParams()
         for page_num, page_layout in enumerate(extract_pages(io.BytesIO(content), laparams=laparams), start=1):
             page_w = float(page_layout.width)
             page_h = float(page_layout.height)
-            debug_log.append(f"--- Page {page_num}: {page_w}x{page_h} ---")
 
-            # Log every top-level element type found on the page
-            for i, element in enumerate(page_layout):
-                etype = type(element).__name__
-                is_text = isinstance(element, LTTextContainer)
-                is_fig  = isinstance(element, LTFigure)
-                raw     = element.get_text().strip()[:60] if is_text else ""
-                debug_log.append(
-                    f"  elem[{i}] type={etype} | isText={is_text} | isFigure={is_fig}"
-                    + (f' | text="{raw}"' if raw else "")
-                )
-                # If it's a figure, peek one level inside
-                if is_fig:
-                    for j, child in enumerate(element):
-                        ctype = type(child).__name__
-                        ctext = child.get_text().strip()[:60] if isinstance(child, LTTextContainer) else ""
-                        debug_log.append(
-                            f"    fig_child[{j}] type={ctype}"
-                            + (f' | text="{ctext}"' if ctext else "")
-                        )
-
-            text_blocks = extract_text_blocks(page_layout, page_h, page_w, 0, page_num)
-            debug_log.append(f"  => extracted {len(text_blocks)} text blocks")
+            text_blocks = extract_text_blocks(page_layout, page_h, page_w, page_num)
 
             pages_data.append({
                 "page": page_num,
@@ -125,43 +119,7 @@ async def extract_pdf(file: UploadFile = File(...)):
                 "textBlocks": text_blocks
             })
 
-        # Return both the data and the debug log together
-        return JSONResponse(content={"debug": debug_log, "pages": pages_data})
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
-
-
-# ── DEBUG endpoint ──────────────────────────────────────────────────────────────
-@app.post("/debug-pdf")
-async def debug_pdf(file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-    try:
-        content = await file.read()
-        report = []
-
-        for page_num, page_layout in enumerate(extract_pages(io.BytesIO(content)), start=1):
-            page_info = {
-                "page": page_num,
-                "pageWidth": round(float(page_layout.width), 1),
-                "pageHeight": round(float(page_layout.height), 1),
-                "elements": []
-            }
-            for element in page_layout:
-                elem_type = type(element).__name__
-                raw_text = element.get_text().strip() if isinstance(element, LTTextContainer) else ""
-                page_info["elements"].append({
-                    "type": elem_type,
-                    "isTextContainer": isinstance(element, LTTextContainer),
-                    "isFigure": isinstance(element, LTFigure),
-                    "textPreview": raw_text[:80],
-                    "x0": round(float(element.x0), 2),
-                    "y0": round(float(element.y0), 2),
-                })
-            report.append(page_info)
-
-        return JSONResponse(content=report)
+        return JSONResponse(content=pages_data)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
