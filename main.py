@@ -2,8 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import (
-    LTTextContainer, LTTextLine, LTChar,
-    LTTextBox, LTAnon, LTFigure, LTImage, LTRect, LTLine
+    LTTextContainer, LTTextLine, LTChar, LTFigure, LAParams
 )
 import io
 import os
@@ -17,8 +16,66 @@ def get_font_info(char):
     lower = fontname.lower()
     is_bold = 'bold' in lower
     is_italic = 'italic' in lower or 'oblique' in lower
-    color = "#000000"
-    return fontname, round(float(fontsize), 1), is_bold, is_italic, color
+    return fontname, round(float(fontsize), 1), is_bold, is_italic, "#000000"
+
+
+def extract_text_blocks(container, page_height, page_width, block_id_counter, page_num):
+    """Recursively extract text blocks from any container (page or LTFigure)."""
+    blocks = []
+    for element in container:
+        # Recurse into figures (nested XObjects)
+        if isinstance(element, LTFigure):
+            nested = extract_text_blocks(element, page_height, page_width, block_id_counter + len(blocks), page_num)
+            blocks.extend(nested)
+            continue
+
+        if not isinstance(element, LTTextContainer):
+            continue
+
+        text = element.get_text().strip()
+        if not text:
+            continue
+
+        # Flatten chars: LTTextBox -> LTTextLine -> LTChar
+        chars = []
+        for line in element:
+            if isinstance(line, LTTextLine):
+                for obj in line:
+                    if isinstance(obj, LTChar):
+                        chars.append(obj)
+
+        if chars:
+            font_family, font_size, is_bold, is_italic, color_hex = get_font_info(chars[0])
+        else:
+            font_family, font_size, is_bold, is_italic, color_hex = "Unknown", 10.0, False, False, "#000000"
+
+        alignment = "left"
+        element_center = element.x0 + element.width / 2
+        if abs(element_center - page_width / 2) < 50:
+            alignment = "center"
+
+        idx = block_id_counter + len(blocks)
+        blocks.append({
+            "text": text,
+            "x": round(float(element.x0), 2),
+            "y": round(float(page_height - element.y1), 2),
+            "width": round(float(element.width), 2),
+            "height": round(float(element.height), 2),
+            "fontSize": font_size,
+            "fontFamily": font_family,
+            "colorHex": color_hex,
+            "isBold": is_bold,
+            "isItalic": is_italic,
+            "blockId": f"p{page_num}_b{idx:03d}",
+            "flowGroup": "body",
+            "alignment": alignment,
+            "paragraphSpacing": 6.0,
+            "isFixedPosition": False,
+            "continuedFromId": None,
+            "continuedToId": None
+        })
+
+    return blocks
 
 
 @app.post("/extract-pdf")
@@ -29,59 +86,17 @@ async def extract_pdf(file: UploadFile = File(...)):
         content = await file.read()
         pages_data = []
 
-        for page_num, page_layout in enumerate(extract_pages(io.BytesIO(content)), start=1):
-            text_blocks = []
-            block_id_counter = 0
+        laparams = LAParams()
+        for page_num, page_layout in enumerate(extract_pages(io.BytesIO(content), laparams=laparams), start=1):
+            page_w = float(page_layout.width)
+            page_h = float(page_layout.height)
 
-            for element in page_layout:
-                if isinstance(element, LTTextContainer):
-                    text = element.get_text().strip()
-                    if not text:
-                        continue
-
-                    chars = []
-                    for line in element:
-                        if isinstance(line, LTTextLine):
-                            for obj in line:
-                                if isinstance(obj, LTChar):
-                                    chars.append(obj)
-
-                    if chars:
-                        font_family, font_size, is_bold, is_italic, color_hex = get_font_info(chars[0])
-                    else:
-                        font_family, font_size, is_bold, is_italic, color_hex = "Unknown", 10.0, False, False, "#000000"
-
-                    alignment = "left"
-                    element_center = element.x0 + element.width / 2
-                    if abs(element_center - page_layout.width / 2) < 50:
-                        alignment = "center"
-
-                    block = {
-                        "text": text,
-                        "x": round(float(element.x0), 2),
-                        "y": round(float(page_layout.height - element.y1), 2),
-                        "width": round(float(element.width), 2),
-                        "height": round(float(element.height), 2),
-                        "fontSize": font_size,
-                        "fontFamily": font_family,
-                        "colorHex": color_hex,
-                        "isBold": is_bold,
-                        "isItalic": is_italic,
-                        "blockId": f"p{page_num}_b{block_id_counter:03d}",
-                        "flowGroup": "body",
-                        "alignment": alignment,
-                        "paragraphSpacing": 6.0,
-                        "isFixedPosition": False,
-                        "continuedFromId": None,
-                        "continuedToId": None
-                    }
-                    text_blocks.append(block)
-                    block_id_counter += 1
+            text_blocks = extract_text_blocks(page_layout, page_h, page_w, 0, page_num)
 
             pages_data.append({
                 "page": page_num,
-                "pageWidth": round(float(page_layout.width), 1),
-                "pageHeight": round(float(page_layout.height), 1),
+                "pageWidth": round(page_w, 1),
+                "pageHeight": round(page_h, 1),
                 "textBlocks": text_blocks
             })
 
@@ -92,8 +107,6 @@ async def extract_pdf(file: UploadFile = File(...)):
 
 
 # ── DEBUG endpoint ──────────────────────────────────────────────────────────────
-# Call this first to see exactly what pdfminer finds in your PDF.
-# It reports: element types, raw text, and char count per element.
 @app.post("/debug-pdf")
 async def debug_pdf(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith('.pdf'):
@@ -109,36 +122,17 @@ async def debug_pdf(file: UploadFile = File(...)):
                 "pageHeight": round(float(page_layout.height), 1),
                 "elements": []
             }
-
             for element in page_layout:
                 elem_type = type(element).__name__
-                raw_text = ""
-                text_stripped = ""
-                char_count = 0
-                line_count = 0
-
-                if isinstance(element, LTTextContainer):
-                    raw_text = element.get_text()
-                    text_stripped = raw_text.strip()
-                    for line in element:
-                        if isinstance(line, LTTextLine):
-                            line_count += 1
-                            for obj in line:
-                                if isinstance(obj, LTChar):
-                                    char_count += 1
-
+                raw_text = element.get_text().strip() if isinstance(element, LTTextContainer) else ""
                 page_info["elements"].append({
                     "type": elem_type,
                     "isTextContainer": isinstance(element, LTTextContainer),
-                    "rawTextLength": len(raw_text),
-                    "strippedTextLength": len(text_stripped),
-                    "strippedTextPreview": text_stripped[:80] if text_stripped else "",
-                    "lineCount": line_count,
-                    "charCount": char_count,
+                    "isFigure": isinstance(element, LTFigure),
+                    "textPreview": raw_text[:80],
                     "x0": round(float(element.x0), 2),
                     "y0": round(float(element.y0), 2),
                 })
-
             report.append(page_info)
 
         return JSONResponse(content=report)
