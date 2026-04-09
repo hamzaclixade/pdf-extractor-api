@@ -4,6 +4,7 @@ from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer, LTChar
 import json
 import io
+import os
 
 app = FastAPI(title="PDF Extractor API")
 
@@ -19,7 +20,7 @@ def get_font_info(char):
 
 @app.post("/extract-pdf")
 async def extract_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith('.pdf'):
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
     try:
@@ -43,17 +44,14 @@ async def extract_pdf(file: UploadFile = File(...)):
                     if not text:
                         continue
 
-                    # Simple alignment detection
                     alignment = "left"
                     if abs(element.x0 + element.width/2 - page_layout.width/2) < 50:
                         alignment = "center"
-                    elif abs(element.x0) < 20 and abs(element.x1 - page_layout.width) < 20:
-                        alignment = "justify"
 
                     block = {
                         "text": text,
                         "x": round(float(element.x0), 2),
-                        "y": round(float(page_layout.height - element.y1), 2),   # Convert to top-down
+                        "y": round(float(page_layout.height - element.y1), 2),
                         "width": round(float(element.width), 2),
                         "height": round(float(element.height), 2),
                         "fontSize": font_size,
@@ -89,3 +87,10 @@ async def extract_pdf(file: UploadFile = File(...)):
 @app.get("/")
 async def root():
     return {"message": "PDF Extractor API is running. Use POST /extract-pdf"}
+
+
+# Important: Use Railway's $PORT
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
