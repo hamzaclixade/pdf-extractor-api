@@ -1,7 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextContainer, LTTextLine, LTChar
+from pdfminer.layout import (
+    LTTextContainer, LTTextLine, LTChar,
+    LTTextBox, LTAnon, LTFigure, LTImage, LTRect, LTLine
+)
 import io
 import os
 
@@ -32,12 +35,10 @@ async def extract_pdf(file: UploadFile = File(...)):
 
             for element in page_layout:
                 if isinstance(element, LTTextContainer):
-                    # Extract text first — works independently of char extraction
                     text = element.get_text().strip()
                     if not text:
                         continue
 
-                    # Flatten chars: LTTextBox -> LTTextLine -> LTChar
                     chars = []
                     for line in element:
                         if isinstance(line, LTTextLine):
@@ -45,13 +46,11 @@ async def extract_pdf(file: UploadFile = File(...)):
                                 if isinstance(obj, LTChar):
                                     chars.append(obj)
 
-                    # Use first char for font info, fallback gracefully if none
                     if chars:
                         font_family, font_size, is_bold, is_italic, color_hex = get_font_info(chars[0])
                     else:
                         font_family, font_size, is_bold, is_italic, color_hex = "Unknown", 10.0, False, False, "#000000"
 
-                    # Detect center alignment
                     alignment = "left"
                     element_center = element.x0 + element.width / 2
                     if abs(element_center - page_layout.width / 2) < 50:
@@ -87,6 +86,62 @@ async def extract_pdf(file: UploadFile = File(...)):
             })
 
         return JSONResponse(content=pages_data)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+
+
+# ── DEBUG endpoint ──────────────────────────────────────────────────────────────
+# Call this first to see exactly what pdfminer finds in your PDF.
+# It reports: element types, raw text, and char count per element.
+@app.post("/debug-pdf")
+async def debug_pdf(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    try:
+        content = await file.read()
+        report = []
+
+        for page_num, page_layout in enumerate(extract_pages(io.BytesIO(content)), start=1):
+            page_info = {
+                "page": page_num,
+                "pageWidth": round(float(page_layout.width), 1),
+                "pageHeight": round(float(page_layout.height), 1),
+                "elements": []
+            }
+
+            for element in page_layout:
+                elem_type = type(element).__name__
+                raw_text = ""
+                text_stripped = ""
+                char_count = 0
+                line_count = 0
+
+                if isinstance(element, LTTextContainer):
+                    raw_text = element.get_text()
+                    text_stripped = raw_text.strip()
+                    for line in element:
+                        if isinstance(line, LTTextLine):
+                            line_count += 1
+                            for obj in line:
+                                if isinstance(obj, LTChar):
+                                    char_count += 1
+
+                page_info["elements"].append({
+                    "type": elem_type,
+                    "isTextContainer": isinstance(element, LTTextContainer),
+                    "rawTextLength": len(raw_text),
+                    "strippedTextLength": len(text_stripped),
+                    "strippedTextPreview": text_stripped[:80] if text_stripped else "",
+                    "lineCount": line_count,
+                    "charCount": char_count,
+                    "x0": round(float(element.x0), 2),
+                    "y0": round(float(element.y0), 2),
+                })
+
+            report.append(page_info)
+
+        return JSONResponse(content=report)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
