@@ -5,3 +5,5 @@ python-multipart==0.0.9
 pydantic==2.9.2
 pymupdf==1.24.10
 pdfplumber==0.11.4
+arabic-reshaper==3.0.0
+python-bidi==0.4.2
